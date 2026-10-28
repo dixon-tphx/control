@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { LayoutDashboard, ClipboardList, Wrench, HardHat, BedDouble, Zap, Camera, TrendingUp, Wallet, Menu, X, ChevronRight, ArrowUpRight, ArrowRight, CircleHelp, Download, RotateCcw, Database, CheckCircle2, AlertTriangle, Building2, ShieldCheck, Sparkles } from 'lucide-react';
+import { LayoutDashboard, ClipboardList, Wrench, HardHat, BedDouble, Zap, Camera, TrendingUp, Wallet, Menu, X, ChevronRight, ArrowUpRight, ArrowRight, CircleHelp, Download, RotateCcw, Database, CheckCircle2, AlertTriangle, Building2, ShieldCheck, Sparkles, Users, ShoppingCart, BookOpen, FileBarChart2, LogOut, RefreshCw } from 'lucide-react';
 import { ResponsiveContainer, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, AreaChart, Area } from 'recharts';
 import WorkOrders, { seedOrders, getRecurringFaults } from './modules/WorkOrders';
 import Maintenance, { seedMaintenance } from './modules/Maintenance';
@@ -8,20 +8,39 @@ import Finance, { seedFinance } from './modules/Finance';
 import Inspections, { seedInspections } from './modules/Inspections';
 import { Modal, AREAS, TEAM, todayISO, exportWorkbook } from './shared';
 import { loadData, saveData } from './storage';
+import { AuthProvider, AuthGate, useAuth } from './auth';
+import { loadCloudData, syncCloudData, rebaseCloudChange } from './cloud';
+import { managerRole } from './domain';
+import TeamPerformance from './modules/TeamPerformance';
+import PurchaseOrders, { seedPurchaseOrders } from './modules/PurchaseOrders';
+import ServiceSequences from './modules/ServiceSequences';
+import ExecutiveReports from './modules/ExecutiveReports';
+import { seedProtocols } from './protocols';
+import { seedDailyEnergy } from './modules/DailyEnergy';
 
 const PAGES = [
   { id: 'overview', label: 'Resumen', icon: LayoutDashboard, group: 'OPERACIÓN' },
   { id: 'orders', label: 'Solicitudes de trabajo', icon: ClipboardList },
+  { id: 'performance', label: 'Rendimiento del equipo', icon: Users },
   { id: 'preventive', label: 'Mantenimiento preventivo', icon: Wrench },
   { id: 'corrective', label: 'Plan correctivo', icon: HardHat },
   { id: 'rooms', label: 'Habitaciones 360', icon: BedDouble },
+  { id: 'protocols', label: 'Secuencias de servicio', icon: BookOpen },
   { id: 'energy', label: 'Energéticos', icon: Zap, group: 'CONTROL Y PLANIFICACIÓN' },
   { id: 'rounds', label: 'Recorridas', icon: Camera },
   { id: 'capex', label: 'FF&E / CAPEX', icon: TrendingUp },
+  { id: 'purchases', label: 'Órdenes de compra', icon: ShoppingCart },
   { id: 'budget', label: 'Presupuesto', icon: Wallet },
+  { id: 'weekly', label: 'Informe semanal', icon: FileBarChart2, group: 'INFORMES' },
+  { id: 'monthly', label: 'Ejecutivo mensual', icon: FileBarChart2 },
 ];
 function initialData() {
-  return { schemaVersion: 1, createdAt: new Date().toISOString(), orders: seedOrders(), ...seedMaintenance(), ...seedInspections(), ...seedEnergy(), ...seedFinance() };
+  return { schemaVersion: 2, createdAt: new Date().toISOString(), orders: seedOrders(), ...seedMaintenance(), ...seedInspections(), ...seedEnergy(), ...seedFinance(), ...seedPurchaseOrders(), ...seedDailyEnergy(), ...seedProtocols(), reportSnapshots: [] };
+}
+export function migrateData(saved) {
+  const defaults = initialData();
+  if (!saved || ![1, 2].includes(saved.schemaVersion)) return defaults;
+  return { ...defaults, ...saved, schemaVersion: 2 };
 }
 function Overview({ data, go }) {
   const active = data.orders.filter((o) => o.status !== 'completed');
@@ -60,9 +79,13 @@ function Overview({ data, go }) {
   </>;
 }
 
-export default function App() {
+function SigmaApplication() {
+  const { profile, configured, signOut } = useAuth();
+  const isManager = managerRole(profile);
+  const visiblePages = PAGES.filter((item) => isManager || item.id === 'orders' || (profile.role === 'technician' && item.id === 'protocols'));
+  const dataRef = useRef(null), savedRef = useRef(null), queuedRef = useRef(null), saveQueue = useRef(Promise.resolve());
   const [data, setData] = useState(null);
-  const [page, setPage] = useState('overview');
+  const [page, setPage] = useState(isManager ? 'overview' : 'orders');
   const [mobileNav, setMobileNav] = useState(false);
   const [smallScreen, setSmallScreen] = useState(() => window.innerWidth < 900);
   const [dialog, setDialog] = useState(null);
@@ -73,14 +96,36 @@ export default function App() {
   const notify = (message) => { clearTimeout(toastTimer.current); setToast(message); toastTimer.current = setTimeout(() => setToast(''), 6500); };
   useEffect(() => {
     let mounted = true;
-    loadData().then((saved) => { if (mounted) { setData(saved?.schemaVersion === 1 ? saved : initialData()); setStorageState('saved'); } }).catch(() => { if (mounted) { setData(initialData()); setStorageState('error'); } });
+    const operation = configured ? loadCloudData(initialData, profile) : loadData().then(migrateData);
+    operation.then((loaded) => {
+      if (!mounted) return;
+      dataRef.current = loaded; savedRef.current = loaded; queuedRef.current = loaded;
+      setData(loaded); setStorageState('saved');
+    }).catch((error) => {
+      if (!mounted) return;
+      if (configured) { notify(`No se pudieron cargar los datos compartidos: ${error.message}`); setStorageState('error'); }
+      else { const fallback = initialData(); dataRef.current = fallback; queuedRef.current = fallback; setData(fallback); setStorageState('error'); }
+    });
     return () => { mounted = false; };
-  }, []);
+  }, [profile.id, configured]);
   useEffect(() => {
-    if (!data) return;
+    if (!data || data === savedRef.current) return;
+    dataRef.current = data;
+    const previous = queuedRef.current; const intended = data;
+    queuedRef.current = intended;
     setStorageState('saving');
-    saveData(data).then(() => setStorageState('saved')).catch(() => { setStorageState('error'); notify('No se pudo guardar. Descarga una copia de seguridad antes de cerrar.'); });
-  }, [data]);
+    saveQueue.current = saveQueue.current.catch(() => {}).then(async () => {
+      const base = savedRef.current || previous;
+      const desired = configured ? rebaseCloudChange(previous, intended, base) : intended;
+      const result = configured ? (desired === base ? base : await syncCloudData(base, desired, profile)) : (await saveData(intended), intended);
+      savedRef.current = result;
+      if (dataRef.current === intended) {
+        queuedRef.current = result; dataRef.current = result;
+        if (result !== intended) setData(result);
+        setStorageState('saved');
+      }
+    }).catch((error) => { setStorageState('error'); notify(`No se guardaron los últimos cambios: ${error.message}. Conserva una copia antes de salir.`); });
+  }, [data, configured, profile.id]);
   useEffect(() => {
     const query = window.matchMedia('(max-width: 899px)');
     const handler = () => { setSmallScreen(query.matches); if (!query.matches) setMobileNav(false); };
@@ -95,11 +140,12 @@ export default function App() {
     document.addEventListener('keydown', handler);
     return () => { document.body.style.overflow = overflow; document.removeEventListener('keydown', handler); mobileButton.current?.focus(); };
   }, [mobileNav]);
-  const go = (id) => { setPage(id); setMobileNav(false); window.scrollTo({ top: 0, behavior: 'instant' }); };
-  const backup = () => { const url = URL.createObjectURL(new Blob([JSON.stringify(data)], { type: 'application/json' })); const a = document.createElement('a'); a.href = url; a.download = `control-respaldo-${todayISO()}.json`; a.click(); setTimeout(() => URL.revokeObjectURL(url), 1000); notify('Copia descargada con datos, historial y fotografías.'); };
+  const go = (id) => { if (!visiblePages.some((item) => item.id === id)) return; setPage(id); setMobileNav(false); window.scrollTo({ top: 0, behavior: 'instant' }); };
+  const backup = () => { if (!isManager) return; const url = URL.createObjectURL(new Blob([JSON.stringify(data)], { type: 'application/json' })); const a = document.createElement('a'); a.href = url; a.download = `sigma-ing-respaldo-${todayISO()}.json`; a.click(); setTimeout(() => URL.revokeObjectURL(url), 1000); notify('Copia descargada con datos, historial y fotografías.'); };
   const exportAll = async () => {
+    if (!isManager) return;
     setExporting(true);
-    try { await exportWorkbook(`control-ingenieria-${todayISO()}`, [
+    try { await exportWorkbook(`sigma-ing-ingenieria-${todayISO()}`, [
       { name: 'Solicitudes', rows: data.orders.map((o) => ({ ID: o.id, Trabajo: o.title, Descripción: o.description, Área: o.area, Edificio: o.building, Habitación: o.roomId || '', Ubicación: o.location || '', Responsable: TEAM.find((m) => m.id === o.owner)?.name || '', Prioridad: o.priority, Estado: o.status, 'Avance %': o.progress, Avería: o.fault, Origen: o.source, Creación: o.createdAt, Inicio: o.startedAt, Cierre: o.closedAt })) },
       { name: 'Preventivos', rows: data.preventivePlans.map((p) => ({ ID: p.id, Equipo: p.equipment, Área: p.area, Edificio: p.building, Frecuencia: p.frequency, 'Próxima revisión': p.nextDate, Checklist: p.checks.join('; ') })) },
       { name: 'Historial preventivo', rows: data.preventiveRuns.map((r) => ({ ID: r.id, Plan: r.planId, Fecha: r.date, Edificio: r.building, Significativos: r.significant, Correctivos: r.orderIds?.join('; '), Checklist: r.checks })) },
@@ -108,33 +154,49 @@ export default function App() {
       { name: 'Energéticos', rows: data.energyRecords },
       { name: 'Recorridas', rows: data.rounds.map((r) => ({ ...r, photos: undefined, 'Cantidad de fotos': r.photos?.length || 0 })) },
       { name: 'FF&E CAPEX', rows: data.capex }, { name: 'Movimientos presupuesto', rows: data.budgetEntries }, { name: 'Presupuestos mensuales', rows: data.monthlyBudgets },
+      { name: 'Reportes técnicos', rows: data.orders.flatMap((order) => (order.reports || []).map(({ photos, ...report }) => ({ Solicitud: order.id, ...report, Fotos: photos?.length || 0 }))), images: data.orders.flatMap((order) => (order.reports || []).flatMap((report) => (report.photos || []).map((photo) => ({ url: photo.url, name: `${order.id} · ${report.authorName || ''} · ${photo.name || ''}` })))) },
+      { name: 'Lecturas diarias', rows: data.dailyReadings || [] },
+      { name: 'Cargas GLP', rows: data.gasDeliveries || [] },
+      { name: 'Residuos diarios', rows: data.wasteReadings || [] },
+      { name: 'Órdenes de compra', rows: data.purchaseOrders || [] },
+      { name: 'Secuencias de servicio', rows: (data.protocols || []).map((protocol) => ({ ID: protocol.id, Título: protocol.title, Categoría: protocol.category, Versión: protocol.version, Revisión: protocol.reviewStatus, Fuente: protocol.sourceFiles?.join('; '), Pasos: protocol.steps, Contactos: protocol.contacts })) },
+      { name: 'Bitácora de secuencias', rows: (data.protocolRuns || []).map(({ photos, ...run }) => ({ ...run, Fotos: photos?.length || 0 })) },
+      { name: 'Informes ejecutivos', rows: data.reportSnapshots || [] },
     ]); notify('Excel general descargado. Cada módulo también exporta sus indicadores.'); }
     catch { notify('No se pudo generar el Excel. Inténtalo nuevamente.'); }
     finally { setExporting(false); }
   };
-  if (!data) return <div className="app-loading"><span className="brand-icon"><LayoutDashboard size={28} /></span><h1>control.</h1><p>Preparando tu espacio de ingeniería…</p></div>;
-  const props = { data, setData, notify };
+  if (!data) return <div className="app-loading"><img src="/sigma-logo.png" alt="SIGMA" width="300" /><p>{storageState === "error" ? "No se pudo cargar el espacio de trabajo. Revisa la conexión y vuelve a intentarlo." : "Preparando tu espacio de ingeniería…"}</p>{storageState === "error" && <button className="button secondary" onClick={() => window.location.reload()}>Reintentar</button>}</div>;
+  const props = { data, setData, notify, user: profile, currentUser: profile };
   return <div className="app-shell"><a className="skip-link" href="#main-content">Saltar al contenido</a>{mobileNav && <div className="sidebar-backdrop" onClick={() => setMobileNav(false)} />}
     <aside ref={navRef} className={`sidebar ${mobileNav ? 'open' : ''}`} aria-label="Menú de ingeniería" inert={smallScreen && !mobileNav ? true : undefined}>
-      <div className="brand"><span className="brand-icon"><LayoutDashboard size={24} /></span><span>control<span className="brand-period">.</span></span><button className="icon-button mobile-only" aria-label="Cerrar menú" onClick={() => setMobileNav(false)}><X size={20} /></button></div>
+      <div className="brand"><img src="/sigma-logo.png" alt="SIGMA · Engineering Management System" className="sigma-sidebar-logo" /><button className="icon-button mobile-only" aria-label="Cerrar menú" onClick={() => setMobileNav(false)}><X size={20} /></button></div>
       <div className="hotel-label"><Building2 size={15} /><span>Ingeniería hotelera</span><span className="hotel-label-count">123</span></div>
-      <nav className="nav-list">{PAGES.map(({ id, label, icon: Icon, group }) => <div key={id}>{group && <div className="workspace-label">{group}</div>}<button className={`nav-item ${page === id ? 'active' : ''}`} aria-current={page === id ? 'page' : undefined} onClick={() => go(id)}><Icon className="nav-icon" size={18} /><span>{label}</span>{id === 'orders' && <span className="nav-count">{data.orders.filter((o) => o.status !== 'completed').length}</span>}</button></div>)}</nav>
-      <div className="sidebar-footer"><div className="demo-card"><span className="demo-card-icon"><ShieldCheck size={19} /></span><h3>Un espacio para probar</h3><p>Datos de ejemplo guardados en este navegador.</p><button onClick={backup}><Download size={14} />Descargar respaldo</button></div><div className="sidebar-user"><span className="avatar workspace-avatar">D</span><div className="user-info"><strong>Ingeniería · Dixon</strong><span>Primera versión · demo</span></div><span className="online-dot" /></div></div>
+      <nav className="nav-list">{visiblePages.map(({ id, label, icon: Icon, group }) => <div key={id}>{group && <div className="workspace-label">{group}</div>}<button className={`nav-item ${page === id ? 'active' : ''}`} aria-current={page === id ? 'page' : undefined} onClick={() => go(id)}><Icon className="nav-icon" size={18} /><span>{label}</span>{id === 'orders' && <span className="nav-count">{data.orders.filter((o) => o.status !== 'completed').length}</span>}</button></div>)}</nav>
+      <div className="sidebar-footer"><div className="demo-card"><span className="demo-card-icon"><ShieldCheck size={19} /></span><h3>Ingeniería estratégica.</h3><p>Control inteligente. Excelencia operativa.</p>{isManager && <button onClick={backup}><Download size={14} />Descargar respaldo</button>}</div><div className="sidebar-user"><span className="avatar workspace-avatar">{profile.name?.charAt(0) || "S"}</span><div className="user-info"><strong>{profile.name}</strong><span>{({ admin: "Administración", coordinator: "Coordinación", technician: "Técnico", requester: "Solicitante" })[profile.role]}</span></div><button className="icon-button" aria-label="Cerrar sesión" onClick={() => signOut()}><LogOut size={17} /></button></div></div>
     </aside>
-    <div className="workspace"><header className="topbar"><div className="topbar-left"><button ref={mobileButton} className="icon-button mobile-menu-button" aria-label="Abrir menú" aria-expanded={mobileNav} onClick={() => setMobileNav(true)}><Menu size={22} /></button><span className="breadcrumb"><span>Mi hotel</span><ChevronRight size={14} /><strong>{PAGES.find((p) => p.id === page).label}</strong></span></div><div className="topbar-right"><span className={`local-storage-status ${storageState}`}><Database size={14} />{storageState === 'saved' ? 'Guardado local' : storageState === 'saving' ? 'Guardando…' : 'Sin guardar'}</span><span className="topbar-divider" /><button className="icon-button" aria-label="Ayuda y datos de la demostración" onClick={() => setDialog('help')}><CircleHelp size={20} /></button><span className="avatar top-avatar">D</span></div></header>
+    <div className="workspace"><header className="topbar"><div className="topbar-left"><button ref={mobileButton} className="icon-button mobile-menu-button" aria-label="Abrir menú" aria-expanded={mobileNav} onClick={() => setMobileNav(true)}><Menu size={22} /></button><span className="breadcrumb"><span>Mi hotel</span><ChevronRight size={14} /><strong>{PAGES.find((p) => p.id === page).label}</strong></span></div><div className="topbar-right"><span className={`local-storage-status ${storageState}`}><Database size={14} />{storageState === 'saved' ? (configured ? 'Sincronizado' : 'Guardado local') : storageState === 'saving' ? 'Guardando…' : 'Sin guardar'}</span><span className="topbar-divider" /><button className="icon-button" aria-label="Ayuda y datos de la demostración" onClick={() => setDialog('help')}><CircleHelp size={20} /></button><span className="avatar top-avatar">{profile.name?.charAt(0) || "S"}</span></div></header>
       <main className="main-content" id="main-content" tabIndex={-1}>
-        <div className="demo-banner"><span className="demo-tag"><span />DEMO INTERACTIVA</span><p>Datos de ejemplo · guardado en este navegador · sin conexión a sistemas reales.</p><button aria-label="Información de la demostración" onClick={() => setDialog('help')}><ArrowUpRight size={17} /></button></div>
+        <div className="demo-banner"><span className="demo-tag"><span />{configured ? "ESPACIO COMPARTIDO" : "DEMOSTRACIÓN LOCAL"}</span><p>{configured ? "Acceso personal con permisos por rol y datos compartidos." : "Perfiles de prueba · datos en este navegador · sin cuentas multiusuario reales."}</p><button aria-label="Información de la demostración" onClick={() => setDialog('help')}><ArrowUpRight size={17} /></button></div>
         {storageState === 'error' && <div className="alert-box" role="alert"><AlertTriangle size={20} /><p>No se pudo guardar. Los cambios están solo en memoria. Descarga una copia antes de cerrar.</p><button className="button secondary small" onClick={backup}>Descargar respaldo</button></div>}
         {page !== 'overview' && <div className="module-eyebrow"><span className="eyebrow">INGENIERÍA HOTELERA</span><h1>{PAGES.find((p) => p.id === page).label}</h1></div>}
         {page === 'overview' && <Overview data={data} go={go} />}
-        {(page === 'orders' || page === 'corrective') && <WorkOrders key={page} {...props} mode={page === 'orders' ? 'orders' : 'corrective'} />}
-        {page === 'preventive' && <Maintenance {...props} />}{page === 'energy' && <Energy {...props} />}
+        {(page === 'orders' || page === 'corrective') && <WorkOrders key={`${page}-${profile.id}`} {...props} mode={page === 'orders' ? 'orders' : 'corrective'} />}
+        {page === 'performance' && <TeamPerformance {...props} />}{page === 'preventive' && <Maintenance {...props} />}{page === 'energy' && <Energy {...props} />}{page === 'protocols' && <ServiceSequences {...props} />}{page === 'purchases' && <PurchaseOrders {...props} />}{(page === 'weekly' || page === 'monthly') && <ExecutiveReports key={page} {...props} mode={page} />}
         {(page === 'rooms' || page === 'rounds') && <Inspections key={page} {...props} mode={page} />}
         {(page === 'capex' || page === 'budget') && <Finance key={page} {...props} mode={page} />}
-        <footer className="main-footer"><span><LayoutDashboard size={14} />control. <span className="footer-divider">/</span> Lo que se mide, se controla.</span><button className="footer-action" onClick={() => setDialog('help')}>Acerca de esta versión<ArrowUpRight size={12} /></button></footer>
+        <footer className="main-footer"><span><span className="sigma-mark">Σ</span>SIGMA <span className="footer-divider">/</span> Lo que se mide, se controla.</span><button className="footer-action" onClick={() => setDialog('help')}>Acerca de esta versión<ArrowUpRight size={12} /></button></footer>
       </main></div>
-    {dialog === 'help' && <Modal title="Tu centro de ingeniería hotelera" onClose={() => setDialog(null)} wide><div className="help-content"><span className="help-illustration"><Building2 size={32} /></span><h3>Una primera versión para explorar el flujo completo.</h3><p>Solicitudes, responsables por área, mantenimiento preventivo y correctivo, 123 habitaciones, indicadores de consumo, recorridas con fotos y planificación financiera.</p><div className="help-notice"><Database size={20} /><p><strong>Este navegador guarda tus pruebas.</strong> El historial no se depura automáticamente, pero depende del espacio disponible y se pierde si borras los datos del sitio. No se sincroniza entre dispositivos. Para garantizar uno o dos años de conservación, fotos y trabajo multiusuario se requiere una base de datos y copias de seguridad en producción.</p></div><p>Las habitaciones 001–123, los edificios, las cuentas y el equipo son ejemplos. Las fotos se optimizan para ahorrar espacio. Excel exporta datos e indicadores; el respaldo JSON incluye también las fotos.</p><div className="inline-actions"><button className="button primary" onClick={exportAll} disabled={exporting}><Download size={16} />{exporting ? 'Generando…' : 'Exportar todo a Excel'}</button><button className="button secondary" onClick={backup}><Database size={16} />Copia con fotos</button></div><hr /><button className="button ghost danger small" onClick={() => setDialog('reset')}><RotateCcw size={15} />Restablecer datos de ejemplo</button></div></Modal>}
-    {dialog === 'reset' && <Modal title="¿Restablecer los datos de ejemplo?" onClose={() => setDialog(null)}><p>Se eliminarán los cambios y fotografías de este navegador. Descarga una copia antes de continuar.</p><div className="modal-footer"><button className="button secondary" onClick={() => setDialog(null)}>Cancelar</button><button className="button danger" onClick={() => { setData(initialData()); setDialog(null); setPage('overview'); notify('Demostración restablecida'); }}>Sí, restablecer</button></div></Modal>}
+    {dialog === 'help' && <Modal title="SIGMA · Sistema Integral de Gestión de Ingeniería" onClose={() => setDialog(null)} wide><div className="help-content"><span className="help-illustration"><Building2 size={32} /></span><h3>Engineering Management System</h3><p>Solicitudes, responsables por área, mantenimiento preventivo y correctivo, 123 habitaciones, indicadores de consumo, recorridas con fotos y planificación financiera.</p><div className="help-notice"><Database size={20} /><p><strong>Conservación y acceso a la información.</strong> {configured ? "Los datos compartidos se protegen con permisos por rol en la base de datos. La retención y las copias de seguridad deben configurarse y comprobarse en el servicio de datos; publicar la web por sí solo no garantiza un archivo anual." : "El historial local no se depura automáticamente, pero depende del espacio del navegador y se pierde si borras los datos del sitio. Los perfiles son una demostración y no se sincronizan entre dispositivos. Para cuentas reales y conservación de uno o dos años se necesita activar la base de datos y sus respaldos."}</p></div><p>Las habitaciones 001–123, los edificios, las cuentas y el equipo inicial son ejemplos configurables. Los informes y Excel incluyen evidencia fotográfica; el respaldo JSON conserva los registros y las fotos. Las secuencias de servicio son plantillas pendientes de revisión y aprobación por el hotel.</p><div className="inline-actions">{isManager && <><button className="button primary" onClick={exportAll} disabled={exporting}><Download size={16} />{exporting ? 'Generando…' : 'Exportar todo a Excel'}</button><button className="button secondary" onClick={backup}><Database size={16} />Copia con fotos</button></>}</div><hr /><button className="button ghost danger small" disabled={configured || !isManager} onClick={() => setDialog('reset')}><RotateCcw size={15} />Restablecer datos de ejemplo</button></div></Modal>}
+    {dialog === 'reset' && !configured && isManager && <Modal title="¿Restablecer los datos de ejemplo?" onClose={() => setDialog(null)}><p>Se eliminarán los cambios y fotografías de este navegador. Descarga una copia antes de continuar.</p><div className="modal-footer"><button className="button secondary" onClick={() => setDialog(null)}>Cancelar</button><button className="button danger" onClick={() => { setData(initialData()); setDialog(null); setPage('overview'); notify('Demostración restablecida'); }}>Sí, restablecer</button></div></Modal>}
     {toast && <div className="toast" role="status"><CheckCircle2 size={19} /><span>{toast}</span><button aria-label="Cerrar notificación" onClick={() => setToast('')}><X size={16} /></button></div>}
   </div>;
+}
+
+export default function App() {
+  return <AuthProvider><AuthGate><AuthenticatedApplication /></AuthGate></AuthProvider>;
+}
+function AuthenticatedApplication() {
+  const { profile, configured } = useAuth();
+  return <SigmaApplication key={`${configured ? 'cloud' : 'local'}-${profile.id}`} />;
 }

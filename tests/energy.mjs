@@ -1,0 +1,34 @@
+import assert from 'node:assert/strict';
+import { createServer } from 'vite';
+const server = await createServer({root:process.cwd(),server:{middlewareMode:true},appType:'custom'});
+let checks=0;
+const test=(name,run)=>{run();checks++;console.log('PASS '+name)};
+try {
+ const {calculateMeterIntervals:meter,calculateTankBalances:tanks,summarizeDailyMonth:month,wasteTotals,FT3_TO_M3}=await server.ssrLoadModule('/src/modules/DailyEnergy.jsx');
+ const row=(date,value,extra={})=>({id:date,date,electricityReadingKwh:value,...extra});
+ test('consumption is difference, never sum',()=>{const r=meter([row('2026-10-01',1000),row('2026-10-02',1120)],'electricity')[1];assert.equal(r.value,120);assert.equal(r.daily,true);assert.equal(r.eligible,true)});
+ test('zero reading is real, blank is missing',()=>{const r=meter([row('2026-10-01',0),row('2026-10-02',null),row('2026-10-03',20)],'electricity');assert.equal(r.length,2);assert.equal(r[1].value,20);assert.equal(r[1].days,2);assert.equal(r[1].daily,false)});
+ test('nonconsecutive interval remains exact, not false daily',()=>{const r=meter([row('2026-10-01',1000),row('2026-10-04',1600)],'electricity')[1];assert.equal(r.value,600);assert.equal(r.days,3);assert.equal(r.daily,false);assert.equal(r.eligible,true)});
+ test('negative difference rejected, no absolute value',()=>{const r=meter([row('2026-10-01',1000),row('2026-10-02',900)],'electricity')[1];assert.equal(r.value,null);assert.equal(r.status,'negative');assert.equal(r.eligible,false)});
+ test('unexplained negative does not silently become new baseline',()=>{const r=meter([row('2026-10-01',1000),row('2026-10-02',100),row('2026-10-03',150)],'electricity');assert.equal(r[2].status,'negative');assert.equal(r[2].previousDate,'2026-10-01')});
+ test('explicit reset opening yields partial excluded from consolidation',()=>{const r=meter([row('2026-10-01',1000),row('2026-10-02',100,{reset:{electricity:true},opening:{electricity:10}}),row('2026-10-03',150)],'electricity');assert.equal(r[1].value,90);assert.equal(r[1].status,'reset');assert.equal(r[1].eligible,false);assert.equal(r[2].value,50);assert.equal(r[2].eligible,true)});
+ test('invalid reset rejected',()=>{const r=meter([row('2026-10-01',100,{reset:{electricity:true},opening:{electricity:150}})],'electricity')[0];assert.equal(r.status,'invalid-reset');assert.equal(r.value,null)});
+ test('cross-month interval never assigned wholly to ending month',()=>{const r=meter([row('2026-10-30',1000),row('2026-11-02',1600)],'electricity')[1];assert.equal(r.value,600);assert.equal(r.eligible,false);assert.equal(month({dailyReadings:[row('2026-10-30',1000),row('2026-11-02',1600)]},'2026-11').electricityKwh,0)});
+ test('same-month gap may contribute to monthly total',()=>{assert.equal(month({dailyReadings:[row('2026-10-01',1000),row('2026-10-04',1600)]},'2026-10').electricityKwh,600)});
+ test('power is peak observed, not added to kWh',()=>{const r=month({dailyReadings:[row('2026-10-01',1000,{demandKw:40}),row('2026-10-02',1100,{demandKw:50})]},'2026-10');assert.equal(r.demandMaxKw,50);assert.equal(r.electricityKwh,100)});
+ test('water independent of electricity and reused water',()=>{const r=month({dailyReadings:[row('2026-10-01',null,{waterReadingM3:100,reusedWaterM3:4}),row('2026-10-02',null,{waterReadingM3:125,reusedWaterM3:5})]},'2026-10');assert.equal(r.waterM3,25);assert.equal(r.reusedWaterM3,9);assert.equal(r.electricityKwh,0)});
+ test('exact cubic foot conversion, no liquid conversion',()=>{assert.equal(FT3_TO_M3,0.028316846592);const dailyReadings=[row('2026-10-01',null,{gasReading:1000,gasMeterUnit:'ft3'}),row('2026-10-02',null,{gasReading:1100,gasMeterUnit:'ft3'}),row('2026-10-03',null,{gasReading:40,gasMeterUnit:'m3'}),row('2026-10-04',null,{gasReading:41,gasMeterUnit:'m3'}),row('2026-10-05',null,{gasReading:100,gasMeterUnit:'L'}),row('2026-10-06',null,{gasReading:150,gasMeterUnit:'L'})];const r=month({dailyReadings},'2026-10');assert.equal(r.gasM3,100*FT3_TO_M3+1);assert.equal(r.gasL,50);assert.equal(r.counts.gasM3,2)});
+ const tankRow=(date,percents,capacities=[3750,3750])=>({id:date,date,tankPercents:percents,tankCapacities:capacities});
+ test('stock = capacity times percentage for each tank',()=>{const r=tanks([tankRow('2026-10-01',[50,60])],[])[0];assert.deepEqual(r.stockByTank,[1875,2250]);assert.equal(r.stockL,4125)});
+ test('tank consumption accounts for deliveries',()=>{const r=tanks([tankRow('2026-10-01',[50,50]),tankRow('2026-10-02',[45,45])],[{date:'2026-10-02',tankIndex:0,litres:100}])[1];assert.equal(r.consumptionL,475);assert.equal(r.stockL,3375);assert.equal(r.deliveryL,100)});
+ test('delivery on previous reading date already in previous stock',()=>{const r=tanks([tankRow('2026-10-01',[50,50]),tankRow('2026-10-02',[45,45])],[{date:'2026-10-01',tankIndex:0,litres:100}])[1];assert.equal(r.consumptionL,375);assert.equal(r.deliveryL,0)});
+ test('negative tank balance not made absolute',()=>{const r=tanks([tankRow('2026-10-01',[50,50]),tankRow('2026-10-02',[60,60])],[])[1];assert.equal(r.consumptionL,null);assert.equal(r.status,'negative')});
+ test('capacity change creates new stock basis',()=>{const r=tanks([tankRow('2026-10-01',[50,50]),tankRow('2026-10-02',[50,50],[4000,4000])],[])[1];assert.equal(r.status,'capacity-change');assert.equal(r.consumptionL,null)});
+ test('tank interval spanning month excluded from monthly estimate',()=>{const r=month({dailyReadings:[tankRow('2026-10-31',[50,50]),tankRow('2026-11-01',[45,45])]},'2026-11');assert.equal(r.tankConsumptionL,0);assert.equal(r.tankCount,0)});
+ test('tank incomplete percentages not treated as zero',()=>{assert.equal(tanks([tankRow('2026-10-01',[50,null])],[]).length,0)});
+ test('oil direct L never counted again via containers',()=>{const r=wasteTotals({plasticKg:10,aluminumKg:2,greaseTrapKg:5,cookingOilL:3,oilContainers:2,containerCapacityL:20,oilMethod:'volume'});assert.equal(r.cookingOilL,3);assert.equal(r.totalKg,17)});
+ test('oil containers method uses count times capacity only',()=>{const r=wasteTotals({cookingOilL:99,oilContainers:2,containerCapacityL:20,oilMethod:'containers'});assert.equal(r.cookingOilL,40);assert.equal(r.totalKg,0)});
+ test('waste monthly mass includes grease, excludes oil litres',()=>{const r=month({wasteReadings:[{date:'2026-10-02',plasticKg:10,aluminumKg:2,greaseTrapKg:5,cookingOilL:3,oilContainers:2,containerCapacityL:20,oilMethod:'volume'}]},'2026-10');assert.equal(r.classifiedWasteKg,12);assert.equal(r.totalWasteKg,17);assert.equal(r.cookingOilL,3)});
+ test('empty month has no demand observation',()=>{assert.equal(month({},'2026-10').demandMaxKw,null)});
+ console.log(JSON.stringify({passed:checks,failed:0}));
+} finally {await server.close()}

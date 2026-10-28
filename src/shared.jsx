@@ -57,22 +57,34 @@ export async function exportWorkbook(filename, sheets) {
   const imported = await import('exceljs');
   const ExcelJS = imported.default || imported;
   const book = new ExcelJS.Workbook();
-  book.creator = 'Control · Ingeniería hotelera';
+  book.creator = 'SIGMA · Sistema Integral de Gestión de Ingeniería';
   book.created = new Date();
   for (const item of sheets) {
     const sheet = book.addWorksheet(item.name.replace(/[\\/*?:\[\]]/g, '').slice(0, 31) || 'Datos');
     const rows = item.rows || [];
     const headers = [...new Set(rows.flatMap((row) => Object.keys(row)))];
-    if (!headers.length) { sheet.addRow(['Sin registros']); continue; }
-    sheet.columns = headers.map((header) => ({ header, key: header, width: Math.min(48, Math.max(16, header.length + 4)) }));
+    if (!headers.length) sheet.addRow(['Sin registros']);
+    else sheet.columns = headers.map((header) => ({ header, key: header, width: Math.min(48, Math.max(16, header.length + 4)) }));
     for (const row of rows) sheet.addRow(Object.fromEntries(Object.entries(row).map(([key, value]) => [key, value && typeof value === 'object' ? JSON.stringify(value) : value ?? ''])));
-    sheet.getRow(1).eachCell((cell) => { cell.font = { bold: true, color: { argb: 'FFFFFFFF' } }; cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF4F63ED' } }; });
+    sheet.getRow(1).eachCell((cell) => { cell.font = { bold: true, color: { argb: 'FFFFFFFF' } }; cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF101820' } }; });
     sheet.views = [{ state: 'frozen', ySplit: 1 }];
-    sheet.autoFilter = { from: { row: 1, column: 1 }, to: { row: Math.max(1, rows.length + 1), column: headers.length } };
+    if (headers.length) sheet.autoFilter = { from: { row: 1, column: 1 }, to: { row: Math.max(1, rows.length + 1), column: headers.length } };
+    // Embedded evidence survives downloading and moving the workbook.
+    let photoRow = Math.max(3, rows.length + 4);
+    for (const photo of item.images || []) {
+      const source = photo.url || photo.dataUrl;
+      if (!source || !/^data:image\/(png|jpeg|jpg);base64,/i.test(source)) continue;
+      const extension = /^data:image\/png/i.test(source) ? 'png' : 'jpeg';
+      const imageId = book.addImage({ base64: source, extension });
+      const row = photo.row ?? photoRow;
+      if (photo.name) sheet.getCell(Math.floor(row), 1).value = String(photo.name);
+      sheet.addImage(imageId, { tl: { col: photo.column ?? 0, row }, ext: { width: photo.width || 440, height: photo.height || 300 }, editAs: 'oneCell' });
+      photoRow = row + 19;
+    }
   }
   const buffer = await book.xlsx.writeBuffer();
   const url = URL.createObjectURL(new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }));
-  const link = document.createElement('a'); link.href = url; link.download = `${filename.replace(/\.xlsx$/i, '')}.xlsx`; link.click();
+  const link = document.createElement('a'); link.href = url; link.download = `${filename.replace(/\.xlsx$/i, '').replace(/^control[-_]/i, 'sigma-ing-')}.xlsx`; link.click();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
@@ -105,5 +117,5 @@ export function PhotoInput({ photos = [], onChange }) {
     catch (err) { setError(err.message); }
     finally { setBusy(false); event.target.value = ''; }
   };
-  return <div className="photo-input"><div className="photo-actions"><label className={`button secondary small ${busy ? 'disabled' : ''}`}>{busy ? <LoaderCircle size={16} className="spinning" /> : <ImagePlus size={16} />}{busy ? 'Procesando…' : 'Subir fotos'}<input className="sr-only" type="file" accept="image/jpeg,image/png,image/webp,image/heic,image/heif,image/avif" multiple onChange={upload} disabled={busy} /></label><label className={`button secondary small ${busy ? 'disabled' : ''}`}><Camera size={16} />Tomar foto<input className="sr-only" type="file" accept="image/*" capture="environment" onChange={upload} disabled={busy} /></label></div><p className="muted photo-hint">Fotos optimizadas para la demostración. Se guardan solo en este navegador.</p>{error && <p className="field-error" role="alert">{error}</p>}<div className="photo-grid">{photos.map((photo) => <div className="photo-item" key={photo.id}><button className="photo-preview" type="button" onClick={() => setPreview(photo)} aria-label={`Ampliar ${photo.name}`}><img src={photo.url} alt={photo.name} /></button><button type="button" className="photo-remove" aria-label={`Quitar ${photo.name}`} onClick={() => onChange(photos.filter((entry) => entry.id !== photo.id))}><Trash2 size={14} /></button></div>)}</div>{preview && <div className="photo-lightbox" role="dialog" aria-modal="true" aria-label="Fotografía ampliada"><button type="button" className="icon-button" aria-label="Cerrar fotografía" onClick={() => setPreview(null)}><X /></button><img src={preview.url} alt={preview.name} /></div>}</div>;
+  return <div className="photo-input"><div className="photo-actions"><label className={`button secondary small ${busy ? 'disabled' : ''}`}>{busy ? <LoaderCircle size={16} className="spinning" /> : <ImagePlus size={16} />}{busy ? 'Procesando…' : 'Subir fotos'}<input className="sr-only" type="file" accept="image/jpeg,image/png,image/webp,image/heic,image/heif,image/avif" multiple onChange={upload} disabled={busy} /></label><label className={`button secondary small ${busy ? 'disabled' : ''}`}><Camera size={16} />Tomar foto<input className="sr-only" type="file" accept="image/*" capture="environment" onChange={upload} disabled={busy} /></label></div><p className="muted photo-hint">Evidencia optimizada en JPEG para las carpetas de trabajo y los informes.</p>{error && <p className="field-error" role="alert">{error}</p>}<div className="photo-grid">{photos.map((photo) => <div className="photo-item" key={photo.id}><button className="photo-preview" type="button" onClick={() => setPreview(photo)} aria-label={`Ampliar ${photo.name}`}><img src={photo.url} alt={photo.name} /></button><button type="button" className="photo-remove" aria-label={`Quitar ${photo.name}`} onClick={() => onChange(photos.filter((entry) => entry.id !== photo.id))}><Trash2 size={14} /></button></div>)}</div>{preview && <div className="photo-lightbox" role="dialog" aria-modal="true" aria-label="Fotografía ampliada"><button type="button" className="icon-button" aria-label="Cerrar fotografía" onClick={() => setPreview(null)}><X /></button><img src={preview.url} alt={preview.name} /></div>}</div>;
 }

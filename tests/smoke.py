@@ -12,7 +12,8 @@ from playwright.sync_api import sync_playwright
 BASE = os.environ.get('TEST_BASE_URL', 'http://127.0.0.1:4173')
 NAV = ['Resumen', 'Solicitudes de trabajo', 'Mantenimiento preventivo',
        'Plan correctivo', 'Habitaciones 360', 'Energéticos', 'Recorridas',
-       'FF&E / CAPEX', 'Presupuesto']
+       'FF&E / CAPEX', 'Presupuesto', 'Rendimiento del equipo', 'Secuencias de servicio',
+       'Órdenes de compra', 'Informe semanal', 'Ejecutivo mensual']
 
 
 def main():
@@ -24,7 +25,14 @@ def main():
         errors = []
         page.on('pageerror', lambda error: errors.append(str(error)))
         page.goto(BASE)
+        page.get_by_label('Correo electrónico', exact=True).fill('admin@sigma.local')
+        page.get_by_label('Contraseña', exact=True).fill('Incorrecta')
+        page.get_by_role('button', name='Iniciar sesión', exact=True).click()
+        page.get_by_role('alert').filter(has_text='Correo o contraseña incorrectos').wait_for()
+        page.get_by_label('Contraseña', exact=True).fill('SigmaAdmin#2026')
+        page.get_by_role('button', name='Iniciar sesión', exact=True).click()
         page.get_by_role('heading', name='Todo bajo control.').wait_for()
+        checks.append('Demo email/password login rejects wrong password and accepts admin')
         page.locator('.dashboard-chart .recharts-surface').wait_for()
         checks.append('Overview and charts render')
 
@@ -37,7 +45,7 @@ def main():
             nav(name)
             page.get_by_role('heading', level=1).wait_for(state='attached')
             assert page.locator('main').inner_text().strip(), name
-        checks.append('All nine modules render')
+        checks.append('All fourteen modules render')
 
         nav('Mantenimiento preventivo')
         page.get_by_role('button', name='Nuevo plan', exact=True).click()
@@ -50,13 +58,17 @@ def main():
         row = page.locator('tbody tr').filter(has_text='Infraestructura del edificio').last
         row.get_by_role('button', name='Revisar', exact=True).click()
         dialog = page.get_by_role('dialog')
-        dialog.get_by_label('Resultado 1', exact=True).select_option('finding')
+        results = dialog.locator('select[aria-label^="Resultado "]')
+        for i in range(results.count()):
+            results.nth(i).select_option('ok')
+        dialog.locator('.check-row').filter(has_text='Revisar muro norte').get_by_role('combobox').select_option('finding')
         dialog.get_by_label('Descripción del hallazgo', exact=True).fill('Fisura significativa en muro norte, requiere evaluación.')
         dialog.get_by_role('checkbox').check()
         dialog.get_by_label('Prioridad del correctivo', exact=True).select_option('high')
         dialog.get_by_label('Resultado 2', exact=True).select_option('ok')
+        dialog.get_by_label('Condición final de servicio', exact=True).select_option('held')
         dialog.get_by_role('button', name='Guardar revisión', exact=True).click()
-        page.get_by_text('trabajo(s) correctivo(s) creado(s)', exact=False).wait_for()
+        page.get_by_text('Hallazgos creados o vinculados al plan correctivo.', exact=False).wait_for()
         checks.append('Preventive checklist generates significant linked corrective')
 
         nav('Plan correctivo')
@@ -78,10 +90,11 @@ def main():
         with ZipFile(target) as workbook:
             assert 'xl/workbook.xml' in workbook.namelist()
             xml = workbook.read('xl/workbook.xml').decode()
-            assert xml.count('<sheet ') == 10
+            assert xml.count('<sheet ') == 18
+            assert 'Lecturas diarias' in xml and 'Reportes técnicos' in xml
             assert 'Historial preventivo' in xml
         page.get_by_role('button', name='Cerrar ventana', exact=True).click()
-        checks.append('General Excel workbook has ten worksheets')
+        checks.append('General Excel workbook has eighteen worksheets')
 
         for width in [360, 390, 768, 1440]:
             page.set_viewport_size({'width': width, 'height': 900})
@@ -90,13 +103,22 @@ def main():
                 page.wait_for_timeout(80)
                 dimensions = page.evaluate('({width:innerWidth,body:document.body.scrollWidth,html:document.documentElement.scrollWidth})')
                 assert dimensions['body'] <= width and dimensions['html'] <= width, (name, dimensions)
-        checks.append('All nine modules fit 360/390/768/1440px viewports')
+        checks.append('All fourteen modules fit 360/390/768/1440px viewports')
         page.reload()
         page.get_by_role('heading', name='Todo bajo control.').wait_for()
         nav('Mantenimiento preventivo')
         page.get_by_role('button', name='Historial (1)', exact=True).click()
         assert 'Infraestructura del edificio' in page.locator('tbody').inner_text()
         checks.append('Saved inspection survives reload')
+        page.get_by_role('button', name='Cerrar sesión', exact=True).click()
+        page.get_by_label('Correo electrónico', exact=True).fill('usuario@sigma.local')
+        page.get_by_label('Contraseña', exact=True).fill('SigmaUsuario#2026')
+        page.get_by_role('button', name='Iniciar sesión', exact=True).click()
+        page.get_by_role('heading', name='Solicita y sigue cada trabajo.').wait_for()
+        assert page.locator('nav .nav-item').count() == 1
+        assert page.locator('nav').get_by_role('button', name='Presupuesto', exact=True).count() == 0
+        checks.append('User email/password login sees requests and no financial navigation')
+
         assert not errors, errors
         checks.append('No uncaught JavaScript errors')
         context.close()
